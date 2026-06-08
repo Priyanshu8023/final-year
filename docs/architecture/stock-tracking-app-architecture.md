@@ -75,7 +75,8 @@ StockVista is a **live stock market tracking web application** inspired by Groww
 | **Stock Data** | Finnhub / Yahoo Finance / Alpha Vantage / Twelve Data / Polygon | Market data APIs |
 | **Charting** | TradingView Lightweight Charts | Candlestick & line charts |
 | **Auth** | JWT (jsonwebtoken) + bcrypt | Authentication & security |
-| **ORM** | Prisma | Type-safe database access |
+| **DB Driver** | pg (node-postgres) | PostgreSQL client driver for Node.js |
+| **Models** | Custom Models | Parameterized raw SQL queries and custom TypeScript entities |
 | **Validation** | Zod | Request/response validation |
 
 ### 2.2 High-Level Architecture Diagram
@@ -261,53 +262,189 @@ erDiagram
 | `exchange` | `VARCHAR(10)` | | Exchange code (NSE, BSE, etc.) |
 | `last_updated` | `TIMESTAMP` | `DEFAULT NOW()` | Last data refresh |
 
-### 3.3 Prisma Schema
+### 3.3 DDL SQL Schema Definition
 
-```prisma
-generator client {
-  provider = "prisma-client-js"
-}
+```sql
+-- DDL schema script representing the tables and their relations
 
-datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
-}
+-- Enable UUID extension if not already present
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
-model User {
-  id        String     @id @default(uuid()) @db.Uuid
-  name      String     @db.VarChar(100)
-  email     String     @unique @db.VarChar(255)
-  password  String     @db.VarChar(255)
-  createdAt DateTime   @default(now()) @map("created_at")
-  updatedAt DateTime   @updatedAt @map("updated_at")
-  watchlist Watchlist[]
+-- Users Table
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(100) NOT NULL,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
 
-  @@map("users")
-}
+-- Stocks Table
+CREATE TABLE stocks (
+    symbol VARCHAR(20) PRIMARY KEY,
+    company_name VARCHAR(255) NOT NULL,
+    sector VARCHAR(100),
+    exchange VARCHAR(10),
+    last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
 
-model Watchlist {
-  id          String   @id @default(uuid()) @db.Uuid
-  userId      String   @map("user_id") @db.Uuid
-  stockSymbol String   @map("stock_symbol") @db.VarChar(20)
-  addedAt     DateTime @default(now()) @map("added_at")
-  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  stock       Stock    @relation(fields: [stockSymbol], references: [symbol])
+-- Watchlists Table
+CREATE TABLE watchlists (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    stock_symbol VARCHAR(20) NOT NULL REFERENCES stocks(symbol) ON DELETE CASCADE,
+    added_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT uq_user_stock UNIQUE (user_id, stock_symbol)
+);
+```
 
-  @@unique([userId, stockSymbol])
-  @@map("watchlists")
-}
+### 3.5 Database Connection Pool
 
-model Stock {
-  symbol      String     @id @db.VarChar(20)
-  companyName String     @map("company_name") @db.VarChar(255)
-  sector      String?    @db.VarChar(100)
-  exchange    String?    @db.VarChar(10)
-  lastUpdated DateTime   @default(now()) @map("last_updated")
-  watchlists  Watchlist[]
+The backend application uses `pg` (node-postgres) with connection pooling (`pg.Pool`) to interact with PostgreSQL.
 
-  @@map("stocks")
+```typescript
+// server/src/database/db.ts
+import { Pool } from 'pg';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 20, // Max number of clients in the pool
+  idleTimeoutMillis: 30000, // Close idle clients after 30 seconds
+  connectionTimeoutMillis: 2000, // Return an error if connection takes >2 seconds
+});
+
+export const query = (text: string, params?: any[]) => {
+  return pool.query(text, params);
+};
+
+export default pool;
+```
+
+### 3.6 Custom Database Models
+
+Instead of using an ORM, we define data models with standard methods that run parameterized SQL queries to prevent SQL injection.
+
+#### User Model
+```typescript
+// server/src/models/user.model.ts
+import { query } from '../database/db';
+import { User } from '../../../shared/types/user';
+
+export class UserModel {
+  static async findById(id: string): Promise<User | null> {
+    const res = await query('SELECT * FROM users WHERE id = $1', [id]);
+    return res.rows[0] || null;
+  }
+
+  static async findByEmail(email: string): Promise<User | null> {
+    const res = await query('SELECT * FROM users WHERE email = $1', [email]);
+    return res.rows[0] || null;
+  }
+
+  static async create(name: string, email: string, passwordHash: string): Promise<User> {
+    const res = await query(
+      `INSERT INTO users (name, email, password) 
+       VALUES ($1, $2, $3) 
+       RETURNING id, name, email, created_at as "createdAt", updated_at as "updatedAt"`,
+      [name, email, passwordHash]
+    );
+    return res.rows[0];
+  }
 }
 ```
+
+#### Stock Model
+```typescript
+// server/src/models/stock.model.ts
+import { query } from '../database/db';
+import { Stock } from '../../../shared/types/stock';
+
+export class StockModel {
+  static async findBySymbol(symbol: string): Promise<Stock | null> {
+    const res = await query('SELECT * FROM stocks WHERE symbol = $1', [symbol]);
+    return res.rows[0] || null;
+  }
+
+  static async search(q: string, limit: number = 10): Promise<Stock[]> {
+    const searchPattern = `%${q}%`;
+    const res = await query(
+      `SELECT symbol, company_name as "companyName", sector, exchange, last_updated as "lastUpdated"
+       FROM stocks 
+       WHERE symbol ILIKE $1 OR company_name ILIKE $1 
+       LIMIT $2`,
+      [searchPattern, limit]
+    );
+    return res.rows;
+  }
+
+  static async upsert(symbol: string, companyName: string, sector?: string, exchange?: string): Promise<Stock> {
+    const res = await query(
+      `INSERT INTO stocks (symbol, company_name, sector, exchange, last_updated) 
+       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+       ON CONFLICT (symbol) DO UPDATE 
+       SET company_name = EXCLUDED.company_name, 
+           sector = COALESCE(EXCLUDED.sector, stocks.sector), 
+           exchange = COALESCE(EXCLUDED.exchange, stocks.exchange),
+           last_updated = CURRENT_TIMESTAMP
+       RETURNING symbol, company_name as "companyName", sector, exchange, last_updated as "lastUpdated"`,
+      [symbol, companyName, sector, exchange]
+    );
+    return res.rows[0];
+  }
+}
+```
+
+#### Watchlist Model
+```typescript
+// server/src/models/watchlist.model.ts
+import { query } from '../database/db';
+import { WatchlistItem } from '../../../shared/types/watchlist';
+
+export class WatchlistModel {
+  static async findByUser(userId: string): Promise<WatchlistItem[]> {
+    const res = await query(
+      `SELECT w.id, w.stock_symbol as "stockSymbol", w.added_at as "addedAt", s.company_name as "companyName"
+       FROM watchlists w
+       JOIN stocks s ON w.stock_symbol = s.symbol
+       WHERE w.user_id = $1
+       ORDER BY w.added_at DESC`,
+      [userId]
+    );
+    return res.rows;
+  }
+
+  static async add(userId: string, stockSymbol: string): Promise<WatchlistItem> {
+    const res = await query(
+      `INSERT INTO watchlists (user_id, stock_symbol) 
+       VALUES ($1, $2) 
+       RETURNING id, stock_symbol as "stockSymbol", added_at as "addedAt"`,
+      [userId, stockSymbol]
+    );
+    return res.rows[0];
+  }
+
+  static async delete(id: string, userId: string): Promise<boolean> {
+    const res = await query(
+      'DELETE FROM watchlists WHERE id = $1 AND user_id = $2',
+      [id, userId]
+    );
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  static async exists(userId: string, stockSymbol: string): Promise<boolean> {
+    const res = await query(
+      'SELECT 1 FROM watchlists WHERE user_id = $1 AND stock_symbol = $2',
+      [userId, stockSymbol]
+    );
+    return res.rows.length > 0;
+  }
+}
+```
+
 
 ### 3.4 Index Strategy
 
@@ -1201,6 +1338,11 @@ Financial-Marketing-Forecasting/
 │   │   │   ├── 📄 stocks.routes.ts    # /api/stocks/* routes
 │   │   │   └── 📄 watchlist.routes.ts # /api/watchlist/* routes
 │   │   │
+│   │   ├── 📂 models/                 # Custom database models (raw SQL queries)
+│   │   │   ├── 📄 user.model.ts       # User database operations
+│   │   │   ├── 📄 stock.model.ts      # Stock database operations
+│   │   │   └── 📄 watchlist.model.ts  # Watchlist database operations
+│   │   │
 │   │   ├── 📂 services/              # Business logic layer
 │   │   │   ├── 📄 finnhub.service.ts  # Finnhub API wrapper (quotes, search, candles)
 │   │   │   ├── 📄 cache.service.ts    # Redis cache wrapper (get/set/del with TTL)
@@ -1215,15 +1357,16 @@ Financial-Marketing-Forecasting/
 │   │   │   └── 📄 price-feed.ts      # Finnhub WS feed → room broadcasts
 │   │   │
 │   │   ├── 📂 database/              # Database utilities
-│   │   │   ├── 📄 prisma.ts          # Prisma client singleton
+│   │   │   ├── 📄 db.ts              # pg connection pool singleton
 │   │   │   └── 📄 seed.ts            # Seed script (initial stocks data)
 │   │   │
 │   │   └── 📂 utils/                 # Shared utilities
 │   │       ├── 📄 jwt.ts             # JWT sign/verify helpers
 │   │       └── 📄 errors.ts          # Custom error classes
 │   │
-│   ├── 📂 prisma/
-│   │   └── 📄 schema.prisma          # Database schema definition
+│   ├── 📂 db/
+│   │   ├── 📄 schema.sql             # SQL DDL database schema definitions
+│   │   └── 📄 seed.sql               # SQL seed script (optional extra seed)
 │   │
 │   ├── 📄 package.json               # Backend dependencies
 │   ├── 📄 tsconfig.json              # TypeScript config
@@ -1267,8 +1410,9 @@ Financial-Marketing-Forecasting/
 | **`server/src/services/`** | Business logic — where the real work happens. `finnhub.service.ts` wraps the external API, `cache.service.ts` wraps Redis, `stock.service.ts` orchestrates DB + API + cache. |
 | **`server/src/middlewares/`** | Express middlewares — auth middleware verifies JWT on every protected route. Validate middleware runs Zod schemas on request bodies. |
 | **`server/src/websocket/`** | WebSocket server — manages rooms, client subscriptions, and the Finnhub price feed. Broadcasts real-time price updates to subscribed clients. |
-| **`server/src/database/`** | Database utilities — Prisma client singleton (prevents connection pool exhaustion in dev), seed script for initial stock data. |
-| **`server/prisma/`** | Prisma schema — defines the database tables, relations, and indexes. Source of truth for the database. |
+| **`server/src/database/`** | Database utilities — `pg.Pool` client helper configuration and database seeding script. |
+| **`server/src/models/`** | Custom database models containing raw SQL queries for user authentication, stock tracking, and watchlists. |
+| **`server/db/`** | SQL schemas — defines the PostgreSQL tables, constraints, foreign keys, and indexes in standard SQL format. Source of truth for the database. |
 | **`shared/types/`** | Shared TypeScript interfaces — ensures frontend and backend agree on data shapes. Import from both projects. |
 
 ---
@@ -1401,7 +1545,7 @@ const validate = (schema: ZodSchema) => (req, res, next) => {
 |---------|---------|---------|
 | **Helmet** | `helmet` | Sets security HTTP headers (X-Content-Type-Options, X-Frame-Options, CSP, etc.) |
 | **HTTPS** | Deployment | All production traffic over TLS 1.3 |
-| **SQL Injection** | Prisma ORM | Parameterized queries by default |
+| **SQL Injection** | pg (node-postgres) | Parameterized queries (using placeholders like $1, $2) to separate code from data |
 | **XSS** | React | Auto-escapes JSX output |
 | **Environment Variables** | `.env` | Secrets never hardcoded |
 
@@ -1538,8 +1682,8 @@ graph LR
 
 #### Connection Pooling
 ```
-Prisma → PgBouncer → PostgreSQL
-(Limits: 20 Prisma connections → 5 PgBouncer connections → PostgreSQL)
+pg.Pool (Express) → PostgreSQL
+(Limits: Express server pools configured with max: 20 connections per instance. PgBouncer is added in Phase 2/3 to pool across multiple scaled Express backend instances)
 ```
 
 #### Redis Caching Strategy
@@ -1570,7 +1714,7 @@ Prisma → PgBouncer → PostgreSQL
 | Task | Priority | Status |
 |------|----------|--------|
 | Project setup (Next.js + Express.js + TypeScript) | P0 | 🔲 |
-| PostgreSQL schema + Prisma migrations | P0 | 🔲 |
+| PostgreSQL schema (DDL) + Database model layer | P0 | 🔲 |
 | Docker Compose (PostgreSQL + Redis) | P0 | 🔲 |
 | User authentication (register, login, JWT) | P0 | 🔲 |
 | Finnhub API integration | P0 | 🔲 |
@@ -1673,7 +1817,7 @@ docker-compose up -d
 # 2. Start backend
 cd server
 npm install
-npx prisma migrate dev
+npm run db:init
 npm run dev
 
 # 3. Start frontend
